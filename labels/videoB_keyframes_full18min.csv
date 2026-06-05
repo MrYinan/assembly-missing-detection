@@ -1,0 +1,8 @@
+time_sec,label,note
+1048.0,NG,clipped 397.0s + 651s; 缺盖异常
+1053.0,NG,clipped 402.0s + 651s; 缺盖异常
+1057.4,NG,clipped 406.4s + 651s; 缺盖异常
+1061.4,OK,clipped 410.4s + 651s; 正常边界帧
+1073.0,NG,clipped 422.0s + 651s; 缺盖异常
+1079.0,NG,clipped 428.0s + 651s; 缺盖异常
+1086.0,OK,clipped 435.0s + 651s; 正常边界帧

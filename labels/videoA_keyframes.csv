@@ -1,0 +1,14 @@
+time_sec,label,note
+240.0,OK,all visible end faces have yellow liner
+260.0,OK,all visible end faces have yellow liner
+300.0,OK,all visible end faces have yellow liner
+350.0,OK,all visible end faces have yellow liner
+360.0,OK,all visible end faces have yellow liner
+374.0,NG,one visible end face is pale / missing yellow liner
+386.0,NG,visible end faces are pale / missing yellow liner
+414.0,NG,visible end faces are pale / missing yellow liner
+430.0,NG,visible end faces are pale / missing yellow liner
+445.0,NG,one visible end face is pale / missing yellow liner
+455.0,OK,all visible end faces have yellow liner
+465.0,OK,all visible end faces have yellow liner
+472.0,OK,all visible end faces have yellow liner
