@@ -4,6 +4,9 @@
 
 系统采用**仅依赖正常样本的异常检测范式**，人工标签不参与训练，通过学习正常装配件在深度特征空间中的分布，实现未知缺陷检测，避免传统监督学习方法对大量异常标注数据的依赖。
 
+## System Overview
+<img width="2816" height="1536" alt="Gemini_Generated_Image_scs6o9scs6o9scs6" src="https://github.com/user-attachments/assets/ecd42efe-4040-4801-b2ff-fc847293f087" />
+
 核心方法基于：
 
 - ImageNet 预训练 ResNet18 特征提取
@@ -13,7 +16,6 @@
 - 局部邻域 Patch 特征增强
 - 像素级异常热力图定位
 - 视频级时序一致性报警策略
-
 
 ## 安装依赖
 ```bash
