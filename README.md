@@ -1,39 +1,19 @@
 # 基于 ResNet-PatchCore 的工业装配件缺失检测 v16
 
-本项目是大作业 03 的深度异常检测版本。核心检测方法采用 **ImageNet 预训练 ResNet + PatchCore Memory Bank + 最近邻异常分数**。OpenCV 只用于视频读取、ROI 定位和结果可视化，不作为主检测模型。
+本项目面向工业流水线装配件质量检测场景，针对端盖缺失、结构异常、局部缺陷等问题，设计并实现了一套基于视觉异常检测的连续视频检测系统。
 
-## 方法特点
+系统采用**仅依赖正常样本的异常检测范式**，通过学习正常装配件在深度特征空间中的分布，实现未知缺陷检测，避免传统监督学习方法对大量异常标注数据的依赖。
 
-- 训练阶段只读取正常装配视频段；
-- ROI 裁剪后送入 ResNet18 提取 patch-level 深度特征；
-- 建立正常 Memory Bank；
-- 测试阶段计算当前 ROI patch 到正常库的最近邻距离；
-- 人工异常时间点只用于最终复核，不参与训练、阈值设定和推理；
-- 新增非作弊式时序后处理：先按 Deep PatchCore 分数生成候选报警，再按连续性与强异常分数过滤短时反光/过渡误报。
+核心方法基于：
 
-## 文件结构
+- ImageNet 预训练 ResNet18 特征提取
+- PatchCore 风格局部特征记忆建模
+- Memory Bank 最近邻距离异常评分
+- Coreset sampling 特征库压缩
+- 局部邻域 Patch 特征增强
+- 像素级异常热力图定位
+- 视频级时序一致性报警策略
 
-```text
-configs/                    # Video A / Video B 配置
-src/deep_patchcore.py        # ResNet 特征提取 + Memory Bank
-src/detectors.py             # Video A / Video B 检测器
-src/pipeline.py              # 训练、完整测试段推理、视频渲染
-src/evaluate_keyframes.py    # 人工复核点评价，只在推理后使用
-src/generate_figures.py      # 完整测试段曲线和报警时间轴
-labels/                      # 人工复核标签
-scripts/                     # 一键运行脚本
-```
-
-## 放置视频
-把完整 18 分 11 秒 Video B 放到：
-```text
-data/videoB_new.mp4
-```
-
-把 Video A 放到：
-```text
-data/videoA.mp4
-```
 
 ## 安装依赖
 ```bash
