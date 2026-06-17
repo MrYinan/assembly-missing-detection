@@ -5,9 +5,7 @@ This project targets the quality inspection of assembly parts on industrial prod
 The system follows a **normal-only anomaly detection paradigm**: manual labels are not used during training. By learning the distribution of normal assembly parts in the deep feature space, it achieves the detection of unknown defects, avoiding the reliance of traditional supervised learning methods on large amounts of annotated anomaly data.
 
 ## System Overview
-<img width="2816" height="1536" alt="Gemini_Generated_Image_scs6o9scs6o9scs6" src="https://github.com/user-attachments/assets/ecd42efe-4040-4801-b2ff-fc847293f087" />
-![Uploading Gemini_Generated_Image_742g2h742g2h742g.png…]()
-
+![Uploading Gemini_Generated_Image_scs6o9scs6o9scs6 (1).png…]()
 
 
 
