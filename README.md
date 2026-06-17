@@ -1,12 +1,13 @@
-<img width="2750" height="1536" alt="Gemini_Generated_Image_742g2h742g2h742g" src="https://github.com/user-attachments/assets/e63dfb7e-5867-402d-bf15-1a7c45f04455" />#  Industrial Assembly Anomaly Detection System Based on Normal Feature Modeling
+#  Industrial Assembly Anomaly Detection System Based on Normal Feature Modeling
 
 This project targets the quality inspection of assembly parts on industrial production lines. It designs and implements a continuous video inspection system based on visual anomaly detection to address issues such as missing end caps, structural anomalies, and local defects.
 
 The system follows a **normal-only anomaly detection paradigm**: manual labels are not used during training. By learning the distribution of normal assembly parts in the deep feature space, it achieves the detection of unknown defects, avoiding the reliance of traditional supervised learning methods on large amounts of annotated anomaly data.
 
 ## System Overview
-![Uploading Gemini_Generated_Image_scs6o9scs6o9scs6 (1).png…]()
 
+
+<img width="2816" height="1536" alt="Gemini_Generated_Image_scs6o9scs6o9scs6 (1)" src="https://github.com/user-attachments/assets/10dbbda1-7b86-45d8-853e-93de4de95d01" />
 
 
 The core methods include:
