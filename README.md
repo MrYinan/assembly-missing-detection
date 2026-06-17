@@ -8,7 +8,6 @@ The system follows a **normal-only anomaly detection paradigm**: manual labels a
 
 
 <img width="2816" height="1536" alt="Gemini_Generated_Image_scs6o9scs6o9scs6 (1)" src="https://github.com/user-attachments/assets/10dbbda1-7b86-45d8-853e-93de4de95d01" />
-<img width="1024" height="558" alt="image" src="https://github.com/user-attachments/assets/75178232-24c3-4654-bb6c-b67baab84ee5" />
 
 
 The core methods include:
