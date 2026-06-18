@@ -3,7 +3,7 @@ setlocal
 cd /d %~dp0\..
 if not exist outputs mkdir outputs
 if not exist figures mkdir figures
-python -m src.pipeline --video-id A --video data\videoA.mp4 --config configs\videoA_deep_patchcore.json --normal-start 0 --normal-end 240 --test-start 240 --test-end -1 --train-fps 0.5 --infer-fps 1.0 --video-out-fps 5 --model outputs\videoA_deep_patchcore_model.npz --output-dir outputs --retrain --render-video --min-alarm-samples 8
+python -m src.pipeline --video-id A --video data\videoA.mp4 --config configs\videoA_deep_patchcore.json --normal-start 0 --normal-end 240 --test-start 363 --test-end 400 --train-fps 0.5 --infer-fps 4.0 --video-out-fps 10 --playback-speed 2.5 --model outputs\videoA_deep_patchcore_model.npz --output-dir outputs --retrain --render-video --min-alarm-samples 8
 if errorlevel 1 goto fail
 python -m src.generate_figures --frame-csv outputs\videoA_full_test_frame_predictions.csv --segments-json outputs\videoA_full_test_alarm_segments.json --out-dir figures --prefix videoA
 if errorlevel 1 goto fail

@@ -12,7 +12,7 @@ This is not a YOLO detector and does not use defect frames in training.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 import json
 
 import cv2
@@ -29,6 +29,7 @@ class DeepBackboneConfig:
     batch_size: int = 16
     l2_normalize: bool = True
     allow_untrained_fallback: bool = False
+    patch_neighborhood_size: int = 1       # 1 keeps the baseline; 3 enables local PatchCore-style aggregation.
 
 
 class TorchPatchFeatureExtractor:
@@ -39,6 +40,8 @@ class TorchPatchFeatureExtractor:
     """
     def __init__(self, cfg: DeepBackboneConfig):
         self.cfg = cfg
+        if int(self.cfg.patch_neighborhood_size) < 1 or int(self.cfg.patch_neighborhood_size) % 2 == 0:
+            raise ValueError('patch_neighborhood_size must be a positive odd integer, e.g. 1 or 3.')
         self._load_torch()
         self.model, self.feature_dim = self._load_model()
         self.activations: Dict[str, object] = {}
@@ -133,6 +136,9 @@ class TorchPatchFeatureExtractor:
             with self.torch.no_grad():
                 _ = self.model(x)
             feats = [self.activations[name] for name in self.cfg.layers]
+            k = int(self.cfg.patch_neighborhood_size)
+            if k > 1:
+                feats = [self.F.avg_pool2d(f, kernel_size=k, stride=1, padding=k // 2) for f in feats]
             ref_h, ref_w = feats[0].shape[-2], feats[0].shape[-1]
             ups = []
             for f in feats:
@@ -154,14 +160,80 @@ class TorchPatchFeatureExtractor:
 
 class DeepPatchMemoryBank:
     """PatchCore memory bank with normal-only threshold calibration."""
-    def __init__(self, max_patches: int = 20000, seed: int = 42):
+    def __init__(self, max_patches: int = 20000, seed: int = 42, sampling_method: str = 'random',
+                 coreset_projection_dim: int = 64, coreset_candidate_patches: int = 30000,
+                 coreset_batch_size: int = 2048, coreset_greedy_steps: int = 2048):
         self.max_patches = int(max_patches)
         self.seed = int(seed)
+        self.sampling_method = str(sampling_method).lower()
+        self.coreset_projection_dim = int(coreset_projection_dim)
+        self.coreset_candidate_patches = int(coreset_candidate_patches)
+        self.coreset_batch_size = int(coreset_batch_size)
+        self.coreset_greedy_steps = int(coreset_greedy_steps)
         self.memory: Optional[np.ndarray] = None
         self.mean: Optional[np.ndarray] = None
         self.std: Optional[np.ndarray] = None
         self.threshold: Optional[float] = None
         self.train_roi_scores: Optional[np.ndarray] = None
+
+    def _sample_memory_patches(self, patches: np.ndarray, rng: np.random.Generator) -> tuple[np.ndarray, str, int]:
+        if len(patches) <= self.max_patches:
+            return patches, 'all', int(len(patches))
+        if self.sampling_method in ('random', 'rand'):
+            keep = rng.choice(len(patches), size=self.max_patches, replace=False)
+            return patches[keep], 'random', int(len(patches))
+        if self.sampling_method not in ('coreset', 'greedy_coreset', 'approx_greedy_coreset'):
+            raise ValueError(f'Unsupported memory_sampling_method: {self.sampling_method}')
+        keep = self._approx_greedy_coreset_indices(patches, rng)
+        return patches[keep], 'approx_greedy_coreset', int(len(patches))
+
+    def _approx_greedy_coreset_indices(self, patches: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        n, d = patches.shape
+        target = min(self.max_patches, n)
+        candidate_n = min(n, max(target, self.coreset_candidate_patches))
+        candidate_idx = rng.choice(n, size=candidate_n, replace=False) if candidate_n < n else np.arange(n)
+        cand = patches[candidate_idx].astype(np.float32, copy=False)
+
+        proj_dim = max(1, min(self.coreset_projection_dim, d))
+        if proj_dim < d:
+            projection = rng.normal(0.0, 1.0 / np.sqrt(proj_dim), size=(d, proj_dim)).astype(np.float32)
+            work = cand @ projection
+        else:
+            work = cand.copy()
+        work_mean = work.mean(axis=0, keepdims=True)
+        work_std = work.std(axis=0, keepdims=True) + 1e-6
+        work = ((work - work_mean) / work_std).astype(np.float32)
+
+        greedy_steps = min(target, candidate_n, max(1, int(self.coreset_greedy_steps)))
+        selected = np.empty(greedy_steps, dtype=np.int64)
+        selected_mask = np.zeros(candidate_n, dtype=bool)
+        first = int(rng.integers(candidate_n))
+        selected[0] = first
+        selected_mask[first] = True
+        min_dist2 = self._dist2_to_point(work, work[first])
+        batch = max(1, int(self.coreset_batch_size))
+        for i in range(1, greedy_steps):
+            farthest = int(np.argmax(min_dist2))
+            selected[i] = farthest
+            selected_mask[farthest] = True
+            point = work[farthest]
+            for start in range(0, candidate_n, batch):
+                end = min(candidate_n, start + batch)
+                diff = work[start:end] - point
+                dist2 = np.einsum('ij,ij->i', diff, diff)
+                min_dist2[start:end] = np.minimum(min_dist2[start:end], dist2)
+        if greedy_steps < target:
+            remaining = np.flatnonzero(~selected_mask)
+            fill_n = min(target - greedy_steps, len(remaining))
+            if fill_n > 0:
+                far_remaining = remaining[np.argpartition(min_dist2[remaining], -fill_n)[-fill_n:]]
+                selected = np.concatenate([selected, far_remaining.astype(np.int64)])
+        return candidate_idx[selected[:target]]
+
+    @staticmethod
+    def _dist2_to_point(x: np.ndarray, point: np.ndarray) -> np.ndarray:
+        diff = x - point
+        return np.einsum('ij,ij->i', diff, diff).astype(np.float32)
 
     def fit(self, roi_patch_features: List[np.ndarray], threshold_quantile: float = 0.99,
             threshold_margin: float = 1.05, top_percent: float = 0.01,
@@ -179,9 +251,8 @@ class DeepPatchMemoryBank:
             mem_rois = roi_patch_features
             val_rois = roi_patch_features
         patches = np.concatenate(mem_rois, axis=0).astype(np.float32)
-        if len(patches) > self.max_patches:
-            keep = rng.choice(len(patches), size=self.max_patches, replace=False)
-            patches = patches[keep]
+        source_patch_count = int(len(patches))
+        patches, sampling_method, candidate_patch_count = self._sample_memory_patches(patches, rng)
         self.mean = patches.mean(axis=0, keepdims=True).astype(np.float32)
         self.std = (patches.std(axis=0, keepdims=True) + 1e-6).astype(np.float32)
         self.memory = ((patches - self.mean) / self.std).astype(np.float32)
@@ -191,6 +262,9 @@ class DeepPatchMemoryBank:
         return {
             'normal_roi_count': int(len(roi_patch_features)),
             'memory_patch_count': int(len(self.memory)),
+            'source_patch_count': source_patch_count,
+            'candidate_patch_count': candidate_patch_count,
+            'memory_sampling_method': sampling_method,
             'val_roi_count': int(len(val_rois)),
             'patch_dim': int(patches.shape[1]),
             'threshold': float(self.threshold),
@@ -223,6 +297,15 @@ class DeepPatchMemoryBank:
         top = np.partition(patch_scores, -k)[-k:]
         return float(top.mean())
 
+    def score_roi_with_map(self, patch_features: np.ndarray, top_percent: float = 0.01) -> tuple[float, np.ndarray]:
+        if self.memory is None or self.mean is None or self.std is None:
+            raise RuntimeError('Memory bank not fitted.')
+        z = ((patch_features.astype(np.float32) - self.mean) / self.std).astype(np.float32)
+        patch_scores = self._score_patches_z(z)
+        k = max(1, int(round(len(patch_scores) * top_percent)))
+        top = np.partition(patch_scores, -k)[-k:]
+        return float(top.mean()), patch_scores.astype(np.float32)
+
     def to_npz_dict(self, prefix: str) -> Dict[str, np.ndarray]:
         if self.memory is None or self.mean is None or self.std is None or self.threshold is None:
             raise RuntimeError('Memory bank not fitted.')
@@ -235,8 +318,16 @@ class DeepPatchMemoryBank:
         }
 
     @classmethod
-    def from_npz_dict(cls, data, prefix: str, max_patches: int = 20000, seed: int = 42) -> 'DeepPatchMemoryBank':
-        bank = cls(max_patches=max_patches, seed=seed)
+    def from_npz_dict(cls, data, prefix: str, max_patches: int = 20000, seed: int = 42,
+                      sampling_method: str = 'random', coreset_projection_dim: int = 128,
+                      coreset_candidate_patches: int = 60000,
+                      coreset_batch_size: int = 1024,
+                      coreset_greedy_steps: int = 2048) -> 'DeepPatchMemoryBank':
+        bank = cls(max_patches=max_patches, seed=seed, sampling_method=sampling_method,
+                   coreset_projection_dim=coreset_projection_dim,
+                   coreset_candidate_patches=coreset_candidate_patches,
+                   coreset_batch_size=coreset_batch_size,
+                   coreset_greedy_steps=coreset_greedy_steps)
         bank.memory = data[f'{prefix}_memory'].astype(np.float32)
         bank.mean = data[f'{prefix}_mean'].astype(np.float32)
         bank.std = data[f'{prefix}_std'].astype(np.float32)
