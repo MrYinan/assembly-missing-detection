@@ -35,6 +35,13 @@ class DeepDetectorConfig:
     device: str = 'auto'
     batch_size: int = 16
     allow_untrained_fallback: bool = False
+    patch_neighborhood_size: int = 3
+    memory_sampling_method: str = 'coreset'
+    coreset_projection_dim: int = 64
+    coreset_candidate_patches: int = 30000
+    coreset_batch_size: int = 2048
+    coreset_greedy_steps: int = 2048
+    export_heatmaps: bool = True
     # Optional Video A color sanity check. This is not the main model; it avoids
     # obvious non-yellow misses in the circular-liner video.
     # The threshold is learned from the normal training segment only. During
@@ -66,6 +73,7 @@ class BaseDeepPatchCoreDetector:
                 device=self.cfg.device,
                 batch_size=int(self.cfg.batch_size),
                 allow_untrained_fallback=bool(self.cfg.allow_untrained_fallback),
+                patch_neighborhood_size=int(self.cfg.patch_neighborhood_size),
             )
             self.extractor = TorchPatchFeatureExtractor(bcfg)
         return self.extractor
@@ -85,7 +93,7 @@ class BaseDeepPatchCoreDetector:
     def _crop_circle(self, frame: np.ndarray, circle: List[int]) -> np.ndarray:
         x, y, r = map(int, circle)
         H, W = frame.shape[:2]
-        pad = int(r * 0.9)
+        pad = int(r)
         return frame[max(0, y - pad):min(H, y + pad), max(0, x - pad):min(W, x + pad)]
 
 
@@ -101,8 +109,22 @@ class VideoBDeepPatchCoreDetector(BaseDeepPatchCoreDetector):
         self.roi_cfg = VideoBRoiConfig(**{k: v for k, v in cfg.items() if k in roi_keys})
         self.locator = VideoBSidePortRoiLocator(self.roi_cfg)
         self.banks = {
-            'top': DeepPatchMemoryBank(self.cfg.max_memory_patches, self.cfg.seed),
-            'bottom': DeepPatchMemoryBank(self.cfg.max_memory_patches, self.cfg.seed + 1),
+            'top': DeepPatchMemoryBank(
+                self.cfg.max_memory_patches, self.cfg.seed,
+                sampling_method=self.cfg.memory_sampling_method,
+                coreset_projection_dim=self.cfg.coreset_projection_dim,
+                coreset_candidate_patches=self.cfg.coreset_candidate_patches,
+                coreset_batch_size=self.cfg.coreset_batch_size,
+                coreset_greedy_steps=self.cfg.coreset_greedy_steps,
+            ),
+            'bottom': DeepPatchMemoryBank(
+                self.cfg.max_memory_patches, self.cfg.seed + 1,
+                sampling_method=self.cfg.memory_sampling_method,
+                coreset_projection_dim=self.cfg.coreset_projection_dim,
+                coreset_candidate_patches=self.cfg.coreset_candidate_patches,
+                coreset_batch_size=self.cfg.coreset_batch_size,
+                coreset_greedy_steps=self.cfg.coreset_greedy_steps,
+            ),
         }
 
     def detect_rois(self, frame: np.ndarray, stable_only: bool = True) -> List[Dict]:
@@ -175,7 +197,11 @@ class VideoBDeepPatchCoreDetector(BaseDeepPatchCoreDetector):
         by_center: Dict[int, List[Dict]] = {}
         for (roi, _crop, q), pf in zip(triples, feats):
             pos = roi['position']
-            score = self.banks[pos].score_roi(pf, top_percent=self.cfg.top_percent)
+            if self.cfg.export_heatmaps:
+                score, patch_scores = self.banks[pos].score_roi_with_map(pf, top_percent=self.cfg.top_percent)
+            else:
+                score = self.banks[pos].score_roi(pf, top_percent=self.cfg.top_percent)
+                patch_scores = None
             thr = float(self.banks[pos].threshold)
             norm = float(score / (thr + 1e-9))
             p = {
@@ -189,6 +215,10 @@ class VideoBDeepPatchCoreDetector(BaseDeepPatchCoreDetector):
                 'roi_type': 'bbox',
                 'lap_var': q['lap_var'],
             }
+            if patch_scores is not None:
+                side = int(round(np.sqrt(len(patch_scores))))
+                if side * side == len(patch_scores):
+                    p['patch_scores'] = patch_scores.reshape(side, side)
             preds.append(p)
             by_center.setdefault(int(roi['center_x']), []).append(p)
         alert_thr = float(self.cfg.product_alert_norm_threshold)
@@ -231,7 +261,14 @@ class VideoBDeepPatchCoreDetector(BaseDeepPatchCoreDetector):
         roi_cfg = json.loads(str(data['roi_cfg']))
         det = cls({**deep_cfg, **roi_cfg})
         for pos in ('top', 'bottom'):
-            det.banks[pos] = DeepPatchMemoryBank.from_npz_dict(data, pos, det.cfg.max_memory_patches, det.cfg.seed)
+            det.banks[pos] = DeepPatchMemoryBank.from_npz_dict(
+                data, pos, det.cfg.max_memory_patches, det.cfg.seed,
+                sampling_method=det.cfg.memory_sampling_method,
+                coreset_projection_dim=det.cfg.coreset_projection_dim,
+                coreset_candidate_patches=det.cfg.coreset_candidate_patches,
+                coreset_batch_size=det.cfg.coreset_batch_size,
+                coreset_greedy_steps=det.cfg.coreset_greedy_steps,
+            )
         det.train_summary = json.loads(str(data['train_summary']))
         return det
 
@@ -247,7 +284,14 @@ class VideoADeepPatchCoreDetector(BaseDeepPatchCoreDetector):
         super().__init__(self.deep_cfg)
         self.roi_cfg = VideoARoiConfig(**{k: v for k, v in cfg.items() if k in roi_keys})
         self.locator = VideoACircleRoiLocator(self.roi_cfg)
-        self.bank = DeepPatchMemoryBank(self.cfg.max_memory_patches, self.cfg.seed)
+        self.bank = DeepPatchMemoryBank(
+            self.cfg.max_memory_patches, self.cfg.seed,
+            sampling_method=self.cfg.memory_sampling_method,
+            coreset_projection_dim=self.cfg.coreset_projection_dim,
+            coreset_candidate_patches=self.cfg.coreset_candidate_patches,
+            coreset_batch_size=self.cfg.coreset_batch_size,
+            coreset_greedy_steps=self.cfg.coreset_greedy_steps,
+        )
         self.yellow_threshold = 0.0
 
     def detect_rois(self, frame: np.ndarray, stable_only: bool = True) -> List[Dict]:
@@ -308,7 +352,11 @@ class VideoADeepPatchCoreDetector(BaseDeepPatchCoreDetector):
         feats = extractor.extract_batch([c for _, c, _ in triples]) if triples else []
         preds = []
         for (roi, _crop, yr), pf in zip(triples, feats):
-            score = self.bank.score_roi(pf, self.cfg.top_percent)
+            if self.cfg.export_heatmaps:
+                score, patch_scores = self.bank.score_roi_with_map(pf, self.cfg.top_percent)
+            else:
+                score = self.bank.score_roi(pf, self.cfg.top_percent)
+                patch_scores = None
             deep_norm = float(score / (self.bank.threshold + 1e-9))
 
             # Video A has a very strong semantic cue: a normal product has a
@@ -332,7 +380,7 @@ class VideoADeepPatchCoreDetector(BaseDeepPatchCoreDetector):
 
             label = 'NG' if product_score >= self.cfg.product_alert_norm_threshold else 'OK'
             x, y, r = roi['circle']
-            preds.append({
+            pred = {
                 'label': label,
                 'score': float(score),
                 'norm_score': float(deep_norm),
@@ -346,7 +394,12 @@ class VideoADeepPatchCoreDetector(BaseDeepPatchCoreDetector):
                 'center_x': int(x),
                 'position': 'face',
                 'product_score': float(product_score),
-            })
+            }
+            if patch_scores is not None:
+                side = int(round(np.sqrt(len(patch_scores))))
+                if side * side == len(patch_scores):
+                    pred['patch_scores'] = patch_scores.reshape(side, side)
+            preds.append(pred)
         return preds
 
     def draw(self, frame: np.ndarray, preds: List[Dict], title='Deep ResNet-PatchCore') -> np.ndarray:
@@ -376,7 +429,14 @@ class VideoADeepPatchCoreDetector(BaseDeepPatchCoreDetector):
         deep_cfg = json.loads(str(data['deep_cfg']))
         roi_cfg = json.loads(str(data['roi_cfg']))
         det = cls({**deep_cfg, **roi_cfg})
-        det.bank = DeepPatchMemoryBank.from_npz_dict(data, 'bank', det.cfg.max_memory_patches, det.cfg.seed)
+        det.bank = DeepPatchMemoryBank.from_npz_dict(
+            data, 'bank', det.cfg.max_memory_patches, det.cfg.seed,
+            sampling_method=det.cfg.memory_sampling_method,
+            coreset_projection_dim=det.cfg.coreset_projection_dim,
+            coreset_candidate_patches=det.cfg.coreset_candidate_patches,
+            coreset_batch_size=det.cfg.coreset_batch_size,
+            coreset_greedy_steps=det.cfg.coreset_greedy_steps,
+        )
         det.yellow_threshold = float(data['yellow_threshold'][0])
         det.train_summary = json.loads(str(data['train_summary']))
         return det

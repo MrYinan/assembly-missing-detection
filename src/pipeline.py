@@ -139,6 +139,8 @@ def flatten_predictions(frame_idx: int, t: float, preds: List[Dict]) -> tuple[Di
             for key in ("score", "deep_norm_score", "yellow_defect_score", "yellow_ratio", "yellow_threshold", "threshold"):
                 if key in p:
                     roi_row[key] = float(p[key])
+            if "patch_scores" in p:
+                roi_row["patch_scores"] = p["patch_scores"]
             roi_rows.append(roi_row)
 
     raw_frame_label = "NG" if raw_ng_count > 0 else "OK"
@@ -162,17 +164,47 @@ def train_model(args) -> object:
     return detector
 
 
+def _expand_segments(segments: List[Dict], *, pre_sec: float = 0.0, post_sec: float = 0.0) -> List[Dict]:
+    if not segments:
+        return []
+    expanded = []
+    for seg in segments:
+        item = dict(seg)
+        item["start_sec"] = max(0.0, float(item["start_sec"]) - max(0.0, float(pre_sec)))
+        item["end_sec"] = float(item["end_sec"]) + max(0.0, float(post_sec))
+        item["duration_sec"] = max(0.0, float(item["end_sec"]) - float(item["start_sec"]))
+        expanded.append(item)
+    expanded = sorted(expanded, key=lambda s: float(s["start_sec"]))
+    merged: List[Dict] = []
+    for seg in expanded:
+        if not merged or float(seg["start_sec"]) > float(merged[-1]["end_sec"]):
+            merged.append(seg)
+        else:
+            prev = merged[-1]
+            prev["end_sec"] = max(float(prev["end_sec"]), float(seg["end_sec"]))
+            prev["duration_sec"] = max(0.0, float(prev["end_sec"]) - float(prev["start_sec"]))
+            prev["max_product_score"] = max(float(prev.get("max_product_score", 0.0)), float(seg.get("max_product_score", 0.0)))
+            prev["sample_count"] = int(prev.get("sample_count", 0)) + int(seg.get("sample_count", 0))
+    return merged
+
+
 def _apply_final_labels(frame_df: pd.DataFrame, product_df: pd.DataFrame, roi_df: pd.DataFrame,
-                        accepted_segments: List[Dict]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                        accepted_segments: List[Dict], *, continuous_segment_label: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     frame_df = frame_df.copy(); product_df = product_df.copy(); roi_df = roi_df.copy()
     if frame_df.empty:
         return frame_df, product_df, roi_df
     accepted_mask = frame_df["time_sec"].apply(lambda t: _is_time_in_segments(float(t), accepted_segments))
-    frame_df["frame_label"] = np.where(accepted_mask & (frame_df["raw_frame_label"] == "NG"), "NG", "OK")
+    if continuous_segment_label:
+        frame_df["frame_label"] = np.where(accepted_mask, "NG", "OK")
+    else:
+        frame_df["frame_label"] = np.where(accepted_mask & (frame_df["raw_frame_label"] == "NG"), "NG", "OK")
 
     if not product_df.empty:
         prod_accepted = product_df["time_sec"].apply(lambda t: _is_time_in_segments(float(t), accepted_segments))
-        product_df["product_label"] = np.where(prod_accepted & (product_df["raw_product_label"] == "NG"), "NG", "OK")
+        if continuous_segment_label:
+            product_df["product_label"] = np.where(prod_accepted, "NG", "OK")
+        else:
+            product_df["product_label"] = np.where(prod_accepted & (product_df["raw_product_label"] == "NG"), "NG", "OK")
         # recompute final NG product count per frame
         final_ng = product_df.groupby("frame_idx")["product_label"].apply(lambda s: int((s == "NG").sum()))
         frame_df = frame_df.drop(columns=["ng_product_count"], errors="ignore").merge(
@@ -184,12 +216,52 @@ def _apply_final_labels(frame_df: pd.DataFrame, product_df: pd.DataFrame, roi_df
 
     if not roi_df.empty:
         roi_accepted = roi_df["time_sec"].apply(lambda t: _is_time_in_segments(float(t), accepted_segments))
-        roi_df["roi_label"] = np.where(roi_accepted & (roi_df["raw_roi_label"] == "NG"), "NG", "OK")
+        if continuous_segment_label:
+            roi_df["roi_label"] = np.where(roi_accepted, "NG", "OK")
+        else:
+            roi_df["roi_label"] = np.where(roi_accepted & (roi_df["raw_roi_label"] == "NG"), "NG", "OK")
     return frame_df, product_df, roi_df
 
 
-def _draw_from_roi_rows(frame: np.ndarray, rows: List[Dict]) -> np.ndarray:
+def _patch_scores_to_heatmap(patch_scores, w: int, h: int, threshold: float | None = None) -> np.ndarray | None:
+    if patch_scores is None or w <= 0 or h <= 0:
+        return None
+    scores = np.asarray(patch_scores, np.float32)
+    if scores.ndim == 1:
+        side = int(round(np.sqrt(len(scores))))
+        if side * side != len(scores):
+            return None
+        scores = scores.reshape(side, side)
+    denom = float(threshold) if threshold and threshold > 1e-9 else float(np.percentile(scores, 99) + 1e-9)
+    norm = np.clip(scores / denom, 0.0, 1.0)
+    heat = cv2.resize(norm, (int(w), int(h)), interpolation=cv2.INTER_CUBIC)
+    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=2.0)
+    return np.clip(heat * 255.0, 0, 255).astype(np.uint8)
+
+
+def _overlay_heatmap(frame: np.ndarray, row: Dict, alpha: float = 0.42) -> np.ndarray:
+    if "patch_scores" not in row:
+        return frame
+    x, y, w, h = int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
+    H, W = frame.shape[:2]
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(W, x + w), min(H, y + h)
+    if x1 <= x0 or y1 <= y0:
+        return frame
+    heat = _patch_scores_to_heatmap(row.get("patch_scores"), x1 - x0, y1 - y0, row.get("threshold"))
+    if heat is None:
+        return frame
+    color = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
     out = frame.copy()
+    out[y0:y1, x0:x1] = cv2.addWeighted(out[y0:y1, x0:x1], 1.0 - alpha, color, alpha, 0)
+    return out
+
+
+def _draw_from_roi_rows(frame: np.ndarray, rows: List[Dict], show_heatmap: bool = False) -> np.ndarray:
+    out = frame.copy()
+    if show_heatmap:
+        for r in rows:
+            out = _overlay_heatmap(out, r)
     # draw per ROI boxes; label from final post-processed label
     for r in rows:
         x, y, w, h = int(r["x"]), int(r["y"]), int(r["w"]), int(r["h"])
@@ -212,29 +284,84 @@ def _draw_from_roi_rows(frame: np.ndarray, rows: List[Dict]) -> np.ndarray:
 def _render_video_from_roi_rows(args, roi_df: pd.DataFrame, video_out: Path) -> int:
     if roi_df.empty:
         return 0
+    out_fps = float(args.video_out_fps or args.infer_fps or 1.0)
+    playback_speed = max(0.05, float(getattr(args, "playback_speed", 1.0) or 1.0))
+
+    row_groups = [(float(v["time_sec"].iloc[0]), v.to_dict("records"))
+                  for _k, v in roi_df.sort_values("time_sec").groupby("frame_idx")]
+    if not row_groups:
+        return 0
+    group_times = np.asarray([t for t, _rows in row_groups], np.float32)
+
+    cap = cv2.VideoCapture(str(args.video))
+    if not cap.isOpened():
+        raise FileNotFoundError(args.video)
+    src_fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    start_f = max(0, int(round(float(args.test_start) * src_fps)))
+    end_f = total if args.test_end is None or float(args.test_end) < 0 else min(total, int(round(float(args.test_end) * src_fps)))
+    step = max(1, int(round(src_fps * playback_speed / max(out_fps, 1e-6))))
+
     writer = None
     written = 0
-    # render exactly at sampled inference fps, then write at requested output fps
-    rows_by_frame = {int(k): v.to_dict("records") for k, v in roi_df.groupby("frame_idx")}
-    write_every = max(1, int(round(args.infer_fps / max(args.video_out_fps, 1e-6))))
-    sampled = 0
-    for frame_idx, t, frame in iter_video_samples(args.video, args.test_start, args.test_end, args.infer_fps):
-        rows = rows_by_frame.get(int(frame_idx), [])
-        if sampled % write_every == 0:
-            detected = _draw_from_roi_rows(frame, rows)
-            canvas = side_by_side(frame, detected, "Original", "Detected OK/NG")
-            cv2.putText(canvas, f"t={t:.1f}s  normal-train only + temporal postprocess", (20, canvas.shape[0]-18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 3, cv2.LINE_AA)
-            cv2.putText(canvas, f"t={t:.1f}s  normal-train only + temporal postprocess", (20, canvas.shape[0]-18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (45,45,45), 1, cv2.LINE_AA)
-            if writer is None:
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(str(video_out), fourcc, args.video_out_fps, (canvas.shape[1], canvas.shape[0]))
-            writer.write(canvas)
-            written += 1
-        sampled += 1
+    for frame_idx in range(start_f, end_f, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        t = frame_idx / src_fps
+        nearest = int(np.argmin(np.abs(group_times - t)))
+        rows = row_groups[nearest][1]
+        detected = _draw_from_roi_rows(frame, rows, show_heatmap=bool(args.render_heatmap_video))
+        canvas = side_by_side(frame, detected, "Original", "Detected OK/NG")
+        cv2.putText(canvas, f"t={t:.1f}s  normal-train only + temporal postprocess", (20, canvas.shape[0]-18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 3, cv2.LINE_AA)
+        cv2.putText(canvas, f"t={t:.1f}s  normal-train only + temporal postprocess", (20, canvas.shape[0]-18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (45,45,45), 1, cv2.LINE_AA)
+        if writer is None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(video_out), fourcc, out_fps, (canvas.shape[1], canvas.shape[0]))
+        writer.write(canvas)
+        written += 1
+    cap.release()
     if writer is not None:
         writer.release()
+    return written
+
+
+def _export_heatmap_samples(args, roi_df: pd.DataFrame, out_dir: Path) -> int:
+    if roi_df.empty or "patch_scores" not in roi_df.columns:
+        return 0
+    heat_dir = ensure_dir(out_dir / "heatmaps" / f"video{args.video_id}")
+    sample_rows = roi_df[roi_df["patch_scores"].notna()].copy()
+    if sample_rows.empty:
+        return 0
+    sample_rows["_rank_score"] = sample_rows.get("product_score", sample_rows.get("norm_score", 0.0)).astype(float)
+    sample_rows = sample_rows.sort_values("_rank_score", ascending=False).head(int(args.max_heatmap_samples))
+
+    written = 0
+    cap = cv2.VideoCapture(str(args.video))
+    if not cap.isOpened():
+        return 0
+    for i, (_idx, row) in enumerate(sample_rows.iterrows(), 1):
+        frame_idx = int(row["frame_idx"])
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        overlay = _draw_from_roi_rows(frame, [row.to_dict()], show_heatmap=True)
+        x, y, w, h = int(row["x"]), int(row["y"]), int(row["w"]), int(row["h"])
+        H, W = overlay.shape[:2]
+        pad = 30
+        x0, y0 = max(0, x - pad), max(0, y - pad)
+        x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
+        crop = overlay[y0:y1, x0:x1]
+        if crop.size == 0:
+            continue
+        name = f"{i:02d}_t{float(row['time_sec']):07.2f}_{str(row.get('position','roi'))}_score{float(row.get('product_score', 0.0)):.2f}.jpg"
+        cv2.imwrite(str(heat_dir / name), crop)
+        written += 1
+    cap.release()
     return written
 
 
@@ -285,7 +412,15 @@ def run_inference(args, detector) -> Dict:
         merge_gap_sec=float(args.merge_gap_sec),
         strong_score_threshold=args.segment_strong_score_threshold if args.use_segment_strong_filter else None,
     )
-    frame_df, prod_df, roi_df = _apply_final_labels(frame_df, prod_df, roi_df, accepted_segments)
+    accepted_segments = _expand_segments(
+        accepted_segments,
+        pre_sec=float(args.alarm_pre_extend_sec),
+        post_sec=float(args.alarm_post_extend_sec),
+    )
+    frame_df, prod_df, roi_df = _apply_final_labels(
+        frame_df, prod_df, roi_df, accepted_segments,
+        continuous_segment_label=bool(args.continuous_segment_label),
+    )
 
     # Add final segment stats after label filtering.
     final_flags = (frame_df["frame_label"] == "NG").tolist() if not frame_df.empty else []
@@ -297,16 +432,21 @@ def run_inference(args, detector) -> Dict:
         seg["max_product_score"] = float(frame_df.loc[m, "max_product_score"].max()) if m.any() else 0.0
         seg["ng_sample_count"] = int(m.sum())
 
+    roi_df_for_render = roi_df.copy()
+    roi_df_for_csv = roi_df.drop(columns=["patch_scores"], errors="ignore")
     frame_df.to_csv(frame_csv, index=False, encoding="utf-8-sig")
     prod_df.to_csv(product_csv, index=False, encoding="utf-8-sig")
-    roi_df.to_csv(roi_csv, index=False, encoding="utf-8-sig")
+    roi_df_for_csv.to_csv(roi_csv, index=False, encoding="utf-8-sig")
 
     written = 0
+    heatmap_samples = 0
     render_wall_time = 0.0
     if args.render_video:
         render_t0 = time.perf_counter()
-        written = _render_video_from_roi_rows(args, roi_df, video_out)
+        written = _render_video_from_roi_rows(args, roi_df_for_render, video_out)
         render_wall_time = time.perf_counter() - render_t0
+    if args.export_heatmaps:
+        heatmap_samples = _export_heatmap_samples(args, roi_df_for_render, out_dir)
 
     raw_ng_count = int((frame_df["raw_frame_label"] == "NG").sum()) if not frame_df.empty else 0
     final_ng_count = int((frame_df["frame_label"] == "NG").sum()) if not frame_df.empty else 0
@@ -338,6 +478,9 @@ def run_inference(args, detector) -> Dict:
             "merge_gap_sec": float(args.merge_gap_sec),
             "use_segment_strong_filter": bool(args.use_segment_strong_filter),
             "segment_strong_score_threshold": args.segment_strong_score_threshold,
+            "continuous_segment_label": bool(args.continuous_segment_label),
+            "alarm_pre_extend_sec": float(args.alarm_pre_extend_sec),
+            "alarm_post_extend_sec": float(args.alarm_post_extend_sec),
             "note": "Manual defect timestamps are not used. Weak candidate alarm segments are accepted only if their own anomaly scores are strong enough.",
         },
         "frame_predictions_csv": str(frame_csv),
@@ -345,6 +488,8 @@ def run_inference(args, detector) -> Dict:
         "roi_predictions_csv": str(roi_csv),
         "rendered_video": str(video_out) if args.render_video else None,
         "rendered_frames": written,
+        "heatmap_samples": heatmap_samples,
+        "heatmap_dir": str(out_dir / "heatmaps" / f"video{args.video_id}") if args.export_heatmaps else None,
         "alarm_segments": final_segments,
     }
     save_json(summary, json_path)
@@ -366,23 +511,39 @@ def main():
     p.add_argument("--train-fps", type=float, default=None)
     p.add_argument("--infer-fps", type=float, default=None)
     p.add_argument("--video-out-fps", type=float, default=8.0)
+    p.add_argument("--playback-speed", type=float, default=None)
     p.add_argument("--min-alarm-samples", type=int, default=None)
     p.add_argument("--merge-gap-sec", type=float, default=None)
     p.add_argument("--segment-strong-score-threshold", type=float, default=None)
     p.add_argument("--disable-segment-strong-filter", action="store_true")
+    p.add_argument("--alarm-pre-extend-sec", type=float, default=None)
+    p.add_argument("--alarm-post-extend-sec", type=float, default=None)
+    p.add_argument("--disable-continuous-segment-label", action="store_true")
     p.add_argument("--retrain", action="store_true")
     p.add_argument("--render-video", action="store_true")
+    p.add_argument("--render-heatmap-video", action="store_true")
+    p.add_argument("--disable-export-heatmaps", action="store_true")
+    p.add_argument("--max-heatmap-samples", type=int, default=None)
     args = p.parse_args()
 
     cfg = load_json(args.config) if args.config else {}
     if args.normal_end is None:
         args.normal_end = float(cfg.get("normal_end_sec", 360.0 if args.video_id == "B" else 240.0))
     if args.test_start is None:
-        args.test_start = args.normal_end
+        args.test_start = float(cfg.get("test_start_sec", args.normal_end))
+    if args.test_end is None or args.test_end < 0:
+        args.test_end = float(cfg.get("test_end_sec", args.test_end))
     if args.train_fps is None:
         args.train_fps = float(cfg.get("train_sample_fps", 1.0))
     if args.infer_fps is None:
         args.infer_fps = float(cfg.get("infer_sample_fps", 2.0))
+    if args.playback_speed is None:
+        args.playback_speed = float(cfg.get("playback_speed", 1.0))
+    args.playback_speed = max(0.05, float(args.playback_speed))
+    args.render_heatmap_video = bool(args.render_heatmap_video or cfg.get("render_heatmap_video", False))
+    args.export_heatmaps = bool(cfg.get("export_heatmaps", True)) and not bool(args.disable_export_heatmaps)
+    if args.max_heatmap_samples is None:
+        args.max_heatmap_samples = int(cfg.get("max_heatmap_samples", 24))
     if args.min_alarm_samples is None:
         args.min_alarm_samples = int(cfg.get("min_alarm_samples", 2))
     if args.merge_gap_sec is None:
@@ -390,6 +551,11 @@ def main():
     if args.segment_strong_score_threshold is None:
         args.segment_strong_score_threshold = cfg.get("segment_strong_score_threshold", 1.0)
     args.use_segment_strong_filter = bool(cfg.get("use_segment_strong_filter", True)) and not bool(args.disable_segment_strong_filter)
+    if args.alarm_pre_extend_sec is None:
+        args.alarm_pre_extend_sec = float(cfg.get("alarm_pre_extend_sec", 0.0))
+    if args.alarm_post_extend_sec is None:
+        args.alarm_post_extend_sec = float(cfg.get("alarm_post_extend_sec", 0.0))
+    args.continuous_segment_label = bool(cfg.get("continuous_segment_label", True)) and not bool(args.disable_continuous_segment_label)
     if args.model is None:
         args.model = str(Path(args.output_dir) / f"video{args.video_id}_normal_memory_bank.npz")
 
